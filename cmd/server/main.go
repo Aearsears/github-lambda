@@ -12,6 +12,7 @@ import (
 	"github.com/github-lambda/pkg/logging"
 	"github.com/github-lambda/pkg/metrics"
 	"github.com/github-lambda/pkg/ratelimit"
+	"github.com/github-lambda/pkg/versioning"
 )
 
 func main() {
@@ -115,6 +116,22 @@ func main() {
 		logger.Info("event scheduler started")
 	}
 
+	// Initialize versioning manager
+	versionManager := versioning.NewManager()
+
+	// Load versioning state from file if configured
+	if versionFile := os.Getenv("VERSIONS_FILE"); versionFile != "" {
+		if err := versionManager.LoadFromFile(versionFile); err != nil {
+			logger.Warn("failed to load versions file", logging.Fields{"error": err.Error()})
+		}
+	}
+
+	// Initialize version resolver
+	versionResolver := versioning.NewResolver(versionManager)
+
+	// Initialize versioning HTTP handler
+	versioningHandler := versioning.NewHTTPHandler(versionManager)
+
 	// Initialize admin handler
 	adminHandler := auth.NewAdminHandler(keyStore)
 
@@ -127,8 +144,8 @@ func main() {
 	mux.HandleFunc("/ratelimit/stats", rateLimitMiddleware.Handler())
 
 	// Protected routes
-	mux.HandleFunc("/invoke", handlers.InvokeHandler(d, limiter))
-	mux.HandleFunc("/invoke/async", handlers.AsyncInvokeHandler(d, limiter))
+	mux.HandleFunc("/invoke", handlers.InvokeHandler(d, limiter, versionResolver))
+	mux.HandleFunc("/invoke/async", handlers.AsyncInvokeHandler(d, limiter, versionResolver))
 	mux.HandleFunc("/status/", handlers.StatusHandler(d))
 	mux.HandleFunc("/callback", handlers.CallbackHandler(d, authMiddleware))
 
@@ -137,6 +154,9 @@ func main() {
 
 	// Event source routes
 	eventHandler.RegisterRoutes(mux)
+
+	// Versioning routes (require admin permission)
+	versioningHandler.RegisterRoutes(mux)
 
 	// Determine if auth is enabled
 	authEnabled := os.Getenv("AUTH_DISABLED") != "true"

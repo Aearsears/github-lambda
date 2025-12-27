@@ -27,6 +27,8 @@ type Dispatcher struct {
 type Execution struct {
 	ID           string          `json:"id"`
 	FunctionName string          `json:"function_name"`
+	Version      int             `json:"version,omitempty"`
+	Alias        string          `json:"alias,omitempty"`
 	Status       ExecutionStatus `json:"status"`
 	RunID        int64           `json:"run_id,omitempty"`
 	StartedAt    time.Time       `json:"started_at"`
@@ -66,6 +68,8 @@ func New(token, owner, repo string) *Dispatcher {
 // InvokeRequest represents a request to invoke a function.
 type InvokeRequest struct {
 	FunctionName string          `json:"function_name"`
+	Version      int             `json:"version,omitempty"`
+	Alias        string          `json:"alias,omitempty"`
 	Payload      json.RawMessage `json:"payload"`
 	Timeout      time.Duration   `json:"timeout,omitempty"`
 }
@@ -137,6 +141,8 @@ func (d *Dispatcher) InvokeAsync(ctx context.Context, req InvokeRequest) (*Execu
 	exec := &Execution{
 		ID:           invocationID,
 		FunctionName: req.FunctionName,
+		Version:      req.Version,
+		Alias:        req.Alias,
 		Status:       StatusPending,
 		StartedAt:    time.Now(),
 	}
@@ -146,13 +152,14 @@ func (d *Dispatcher) InvokeAsync(ctx context.Context, req InvokeRequest) (*Execu
 	d.mu.Unlock()
 
 	// Trigger repository_dispatch event
-	payload, _ := json.Marshal(map[string]string{
+	payload, _ := json.Marshal(map[string]interface{}{
 		"function_name": req.FunctionName,
+		"version":       req.Version,
 		"invocation_id": invocationID,
 		"payload":       string(req.Payload),
 	})
 
-	_, _, err := d.client.Repositories.CreateRepositoryDispatch(
+	_, _, err := d.client.Repositories.Dispatch(
 		ctx,
 		d.owner,
 		d.repo,

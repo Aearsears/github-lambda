@@ -12,12 +12,13 @@ import (
 	"github.com/github-lambda/pkg/logging"
 	"github.com/github-lambda/pkg/metrics"
 	"github.com/github-lambda/pkg/ratelimit"
+	"github.com/github-lambda/pkg/versioning"
 )
 
 var logger = logging.New("handlers")
 
 // InvokeHandler handles synchronous function invocations.
-func InvokeHandler(d *dispatcher.Dispatcher, limiter *ratelimit.Limiter) http.HandlerFunc {
+func InvokeHandler(d *dispatcher.Dispatcher, limiter *ratelimit.Limiter, resolver *versioning.Resolver) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -34,6 +35,24 @@ func InvokeHandler(d *dispatcher.Dispatcher, limiter *ratelimit.Limiter) http.Ha
 		if req.FunctionName == "" {
 			http.Error(w, "function_name is required", http.StatusBadRequest)
 			return
+		}
+
+		// Resolve version/alias if resolver is provided
+		var resolvedVersion int
+		var resolvedAlias string
+		if resolver != nil {
+			resolved, err := resolver.Resolve(req.FunctionName)
+			if err != nil {
+				logger.Warn("failed to resolve function version", logging.Fields{
+					"function_name": req.FunctionName,
+					"error":         err.Error(),
+				})
+				http.Error(w, `{"error": "`+err.Error()+`"}`, http.StatusNotFound)
+				return
+			}
+			req.FunctionName = resolved.FunctionName
+			resolvedVersion = resolved.Version
+			resolvedAlias = resolved.Alias
 		}
 
 		// Check function-level access
@@ -64,7 +83,12 @@ func InvokeHandler(d *dispatcher.Dispatcher, limiter *ratelimit.Limiter) http.Ha
 
 		logger.Info("handling sync invocation", logging.Fields{
 			"function_name": req.FunctionName,
+			"version":       resolvedVersion,
+			"alias":         resolvedAlias,
 		})
+
+		// Set version in request for dispatcher
+		req.Version = resolvedVersion
 
 		exec, err := d.Invoke(r.Context(), req)
 		if err != nil {
@@ -78,7 +102,7 @@ func InvokeHandler(d *dispatcher.Dispatcher, limiter *ratelimit.Limiter) http.Ha
 }
 
 // AsyncInvokeHandler handles asynchronous function invocations.
-func AsyncInvokeHandler(d *dispatcher.Dispatcher, limiter *ratelimit.Limiter) http.HandlerFunc {
+func AsyncInvokeHandler(d *dispatcher.Dispatcher, limiter *ratelimit.Limiter, resolver *versioning.Resolver) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -95,6 +119,24 @@ func AsyncInvokeHandler(d *dispatcher.Dispatcher, limiter *ratelimit.Limiter) ht
 		if req.FunctionName == "" {
 			http.Error(w, "function_name is required", http.StatusBadRequest)
 			return
+		}
+
+		// Resolve version/alias if resolver is provided
+		var resolvedVersion int
+		var resolvedAlias string
+		if resolver != nil {
+			resolved, err := resolver.Resolve(req.FunctionName)
+			if err != nil {
+				logger.Warn("failed to resolve function version", logging.Fields{
+					"function_name": req.FunctionName,
+					"error":         err.Error(),
+				})
+				http.Error(w, `{"error": "`+err.Error()+`"}`, http.StatusNotFound)
+				return
+			}
+			req.FunctionName = resolved.FunctionName
+			resolvedVersion = resolved.Version
+			resolvedAlias = resolved.Alias
 		}
 
 		// Check function-level access
@@ -125,7 +167,12 @@ func AsyncInvokeHandler(d *dispatcher.Dispatcher, limiter *ratelimit.Limiter) ht
 
 		logger.Info("handling async invocation", logging.Fields{
 			"function_name": req.FunctionName,
+			"version":       resolvedVersion,
+			"alias":         resolvedAlias,
 		})
+
+		// Set version in request for dispatcher
+		req.Version = resolvedVersion
 
 		exec, err := d.InvokeAsync(r.Context(), req)
 		if err != nil {

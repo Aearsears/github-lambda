@@ -3,12 +3,14 @@ package main
 import (
 	"net/http"
 	"os"
+	"strconv"
 
 	"github.com/github-lambda/internal/dispatcher"
 	"github.com/github-lambda/internal/handlers"
 	"github.com/github-lambda/pkg/auth"
 	"github.com/github-lambda/pkg/logging"
 	"github.com/github-lambda/pkg/metrics"
+	"github.com/github-lambda/pkg/ratelimit"
 )
 
 func main() {
@@ -62,7 +64,40 @@ func main() {
 
 	// Initialize auth middleware
 	authMiddleware := auth.NewMiddleware(keyStore)
-	authMiddleware.SetSkipPaths("/health", "/metrics")
+	authMiddleware.SetSkipPaths("/health", "/metrics", "/ratelimit/stats")
+
+	// Initialize rate limiter with configuration from environment
+	rateLimitConfig := ratelimit.DefaultConfig()
+	if rps := os.Getenv("RATE_LIMIT_RPS"); rps != "" {
+		if v, err := strconv.ParseFloat(rps, 64); err == nil {
+			rateLimitConfig.RequestsPerSecond = v
+		}
+	}
+	if burst := os.Getenv("RATE_LIMIT_BURST"); burst != "" {
+		if v, err := strconv.Atoi(burst); err == nil {
+			rateLimitConfig.BurstSize = v
+		}
+	}
+	if maxConcurrent := os.Getenv("RATE_LIMIT_MAX_CONCURRENT"); maxConcurrent != "" {
+		if v, err := strconv.Atoi(maxConcurrent); err == nil {
+			rateLimitConfig.MaxConcurrent = v
+		}
+	}
+	if queueSize := os.Getenv("RATE_LIMIT_QUEUE_SIZE"); queueSize != "" {
+		if v, err := strconv.Atoi(queueSize); err == nil {
+			rateLimitConfig.MaxQueueSize = v
+		}
+	}
+
+	limiter := ratelimit.New(rateLimitConfig)
+	rateLimitMiddleware := ratelimit.NewMiddleware(limiter)
+
+	logger.Info("rate limiter configured", logging.Fields{
+		"rps":            rateLimitConfig.RequestsPerSecond,
+		"burst":          rateLimitConfig.BurstSize,
+		"max_concurrent": rateLimitConfig.MaxConcurrent,
+		"queue_size":     rateLimitConfig.MaxQueueSize,
+	})
 
 	// Initialize the dispatcher with logging
 	d := dispatcher.New(githubToken, repoOwner, repoName)
@@ -76,10 +111,11 @@ func main() {
 	// Public routes (no auth required)
 	mux.HandleFunc("/health", handlers.HealthHandler)
 	mux.HandleFunc("/metrics", metrics.Default.Handler())
+	mux.HandleFunc("/ratelimit/stats", rateLimitMiddleware.Handler())
 
 	// Protected routes
-	mux.HandleFunc("/invoke", handlers.InvokeHandler(d))
-	mux.HandleFunc("/invoke/async", handlers.AsyncInvokeHandler(d))
+	mux.HandleFunc("/invoke", handlers.InvokeHandler(d, limiter))
+	mux.HandleFunc("/invoke/async", handlers.AsyncInvokeHandler(d, limiter))
 	mux.HandleFunc("/status/", handlers.StatusHandler(d))
 	mux.HandleFunc("/callback", handlers.CallbackHandler(d, authMiddleware))
 
@@ -88,12 +124,21 @@ func main() {
 
 	// Determine if auth is enabled
 	authEnabled := os.Getenv("AUTH_DISABLED") != "true"
+	rateLimitEnabled := os.Getenv("RATE_LIMIT_DISABLED") != "true"
 
 	var handler http.Handler = mux
 
+	// Apply rate limiting middleware if enabled (before auth so we can rate limit unauthenticated requests)
+	if rateLimitEnabled {
+		handler = rateLimitMiddleware.RateLimit(handler)
+		logger.Info("rate limiting enabled")
+	} else {
+		logger.Warn("rate limiting DISABLED - not recommended for production")
+	}
+
 	// Apply authentication middleware if enabled
 	if authEnabled {
-		handler = authMiddleware.RequireAuth(mux)
+		handler = authMiddleware.RequireAuth(handler)
 		logger.Info("authentication enabled")
 	} else {
 		logger.Warn("authentication DISABLED - not recommended for production")
@@ -103,10 +148,11 @@ func main() {
 	handler = metrics.Middleware(handler)
 
 	logger.Info("server starting", logging.Fields{
-		"port":         port,
-		"owner":        repoOwner,
-		"repo":         repoName,
-		"auth_enabled": authEnabled,
+		"port":               port,
+		"owner":              repoOwner,
+		"repo":               repoName,
+		"auth_enabled":       authEnabled,
+		"rate_limit_enabled": rateLimitEnabled,
 	})
 
 	if err := http.ListenAndServe(":"+port, handler); err != nil {

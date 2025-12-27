@@ -11,12 +11,13 @@ import (
 	"github.com/github-lambda/pkg/auth"
 	"github.com/github-lambda/pkg/logging"
 	"github.com/github-lambda/pkg/metrics"
+	"github.com/github-lambda/pkg/ratelimit"
 )
 
 var logger = logging.New("handlers")
 
 // InvokeHandler handles synchronous function invocations.
-func InvokeHandler(d *dispatcher.Dispatcher) http.HandlerFunc {
+func InvokeHandler(d *dispatcher.Dispatcher, limiter *ratelimit.Limiter) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -44,6 +45,22 @@ func InvokeHandler(d *dispatcher.Dispatcher) http.HandlerFunc {
 			http.Error(w, `{"error": "access denied for function"}`, http.StatusForbidden)
 			return
 		}
+
+		// Check function-specific rate limit and concurrency
+		if err := limiter.AcquireFunction(r.Context(), req.FunctionName); err != nil {
+			logger.Warn("function rate/concurrency limit exceeded", logging.Fields{
+				"function_name": req.FunctionName,
+				"error":         err.Error(),
+			})
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Retry-After", "5")
+			w.WriteHeader(http.StatusTooManyRequests)
+			json.NewEncoder(w).Encode(map[string]string{
+				"error": err.Error(),
+			})
+			return
+		}
+		defer limiter.ReleaseFunction(req.FunctionName)
 
 		logger.Info("handling sync invocation", logging.Fields{
 			"function_name": req.FunctionName,
@@ -61,7 +78,7 @@ func InvokeHandler(d *dispatcher.Dispatcher) http.HandlerFunc {
 }
 
 // AsyncInvokeHandler handles asynchronous function invocations.
-func AsyncInvokeHandler(d *dispatcher.Dispatcher) http.HandlerFunc {
+func AsyncInvokeHandler(d *dispatcher.Dispatcher, limiter *ratelimit.Limiter) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -90,6 +107,22 @@ func AsyncInvokeHandler(d *dispatcher.Dispatcher) http.HandlerFunc {
 			return
 		}
 
+		// Check function-specific rate limit (but not concurrency for async)
+		clientKey := getClientKey(r)
+		if err := limiter.Allow(clientKey, req.FunctionName); err != nil {
+			logger.Warn("function rate limit exceeded", logging.Fields{
+				"function_name": req.FunctionName,
+				"error":         err.Error(),
+			})
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusTooManyRequests)
+			json.NewEncoder(w).Encode(map[string]string{
+				"error": err.Error(),
+			})
+			return
+		}
+
 		logger.Info("handling async invocation", logging.Fields{
 			"function_name": req.FunctionName,
 		})
@@ -104,6 +137,30 @@ func AsyncInvokeHandler(d *dispatcher.Dispatcher) http.HandlerFunc {
 		w.WriteHeader(http.StatusAccepted)
 		json.NewEncoder(w).Encode(exec)
 	}
+}
+
+// getClientKey extracts a unique key for rate limiting from the request.
+func getClientKey(r *http.Request) string {
+	if apiKey := auth.GetAPIKey(r.Context()); apiKey != nil {
+		return "key:" + apiKey.ID
+	}
+
+	ip := r.Header.Get("X-Forwarded-For")
+	if ip != "" {
+		if idx := strings.Index(ip, ","); idx != -1 {
+			ip = strings.TrimSpace(ip[:idx])
+		}
+	} else {
+		ip = r.Header.Get("X-Real-IP")
+	}
+	if ip == "" {
+		ip = r.RemoteAddr
+		if idx := strings.LastIndex(ip, ":"); idx != -1 {
+			ip = ip[:idx]
+		}
+	}
+
+	return "ip:" + ip
 }
 
 // StatusHandler handles execution status queries.

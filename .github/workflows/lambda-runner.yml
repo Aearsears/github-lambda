@@ -1,0 +1,69 @@
+name: Lambda Runner
+
+on:
+    repository_dispatch:
+        types: [lambda-invoke]
+
+jobs:
+    execute:
+        runs-on: ubuntu-latest
+        timeout-minutes: 15
+
+        steps:
+            - name: Checkout code
+              uses: actions/checkout@v4
+
+            - name: Set up Go
+              uses: actions/setup-go@v5
+              with:
+                  go-version: "1.21"
+
+            - name: Extract function info
+              id: info
+              run: |
+                  echo "function_name=${{ github.event.client_payload.function_name }}" >> $GITHUB_OUTPUT
+                  echo "invocation_id=${{ github.event.client_payload.invocation_id }}" >> $GITHUB_OUTPUT
+
+            - name: Build and run function
+              id: run
+              env:
+                  LAMBDA_EVENT: |
+                      {
+                        "function_name": "${{ github.event.client_payload.function_name }}",
+                        "invocation_id": "${{ github.event.client_payload.invocation_id }}",
+                        "payload": ${{ github.event.client_payload.payload }}
+                      }
+              run: |
+                  cd functions/${{ steps.info.outputs.function_name }}
+                  go build -o function .
+                  ./function
+
+            - name: Report success
+              if: success()
+              env:
+                  CALLBACK_URL: ${{ secrets.LAMBDA_CALLBACK_URL }}
+              run: |
+                  if [ -n "$CALLBACK_URL" ]; then
+                    curl -X POST "$CALLBACK_URL/callback" \
+                      -H "Content-Type: application/json" \
+                      -d '{
+                        "invocation_id": "${{ steps.info.outputs.invocation_id }}",
+                        "status": "completed",
+                        "result": ${{ steps.run.outputs.result || '{}' }}
+                      }'
+                  fi
+
+            - name: Report failure
+              if: failure()
+              env:
+                  CALLBACK_URL: ${{ secrets.LAMBDA_CALLBACK_URL }}
+              run: |
+                  if [ -n "$CALLBACK_URL" ]; then
+                    curl -X POST "$CALLBACK_URL/callback" \
+                      -H "Content-Type: application/json" \
+                      -d '{
+                        "invocation_id": "${{ steps.info.outputs.invocation_id }}",
+                        "status": "failed",
+                        "error": "Function execution failed"
+                      }'
+                  fi

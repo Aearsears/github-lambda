@@ -174,11 +174,174 @@ Content-Type: application/json
 DELETE /config/env/delete?function=my-function&name=DATABASE_URL
 ```
 
-#### Validate Configuration
+#### Resolve Environment Variables
+
+Returns the fully resolved environment variables for a function, showing the inheritance chain and where each variable comes from:
+
+```
+GET /config/env/resolve?function=my-function
+```
+
+Response:
+
+```json
+{
+    "function_name": "my-function",
+    "inheritance_chain": ["global", "base-config", "my-function"],
+    "resolved_vars": {
+        "ENVIRONMENT": {
+            "name": "ENVIRONMENT",
+            "value": "production",
+            "source": "global",
+            "is_secret": false,
+            "required": false
+        },
+        "DATABASE_URL": {
+            "name": "DATABASE_URL",
+            "value": "[REDACTED]",
+            "source": "my-function",
+            "is_secret": true,
+            "overridden_by": "my-function"
+        }
+    }
+}
+```
+
+### Configuration Inheritance
+
+Functions can inherit environment variables from parent configurations:
+
+```
+POST /config/inherit
+Content-Type: application/json
+
+{
+  "function_name": "my-api-handler",
+  "parents": ["base-api", "production"]
+}
+```
+
+#### Get Inheritance Chain
+
+```
+GET /config/inherit/chain?function=my-function
+```
+
+Variables are resolved in order:
+
+1. **Global environment variables** - Available to all functions
+2. **Inherited configurations** - Resolved recursively, in order specified
+3. **Function-specific variables** - Override inherited values
+
+Example hierarchy:
+
+```
+global
+  └── base-config
+        ├── staging-config
+        │     └── my-staging-function
+        └── production-config
+              └── my-production-function
+```
+
+### Configuration Validation
+
+#### Basic Validation
 
 ```
 GET /config/validate?function=my-function
 ```
+
+#### Advanced Validation
+
+```
+GET /config/validate/advanced?function=my-function&strict=true&validate_secrets=true
+```
+
+Query parameters:
+
+-   `strict=true` - Treat warnings as errors
+-   `validate_secrets=true` - Verify secrets can be resolved
+-   `resolve_env_vars=false` - Skip resolution of env vars
+-   `required_vars=VAR1,VAR2` - Additional required variables
+-   `forbidden_vars=VAR1,VAR2` - Variables that must not be present
+
+Response includes:
+
+```json
+{
+  "valid": true,
+  "function_name": "my-function",
+  "issues": [
+    {
+      "severity": "warning",
+      "code": "POTENTIALLY_SENSITIVE",
+      "message": "environment variable 'API_KEY' may contain sensitive data",
+      "field": "API_KEY",
+      "suggestion": "Mark this variable as a secret or set sensitive=true"
+    }
+  ],
+  "resolved_env_vars": { ... },
+  "inheritance_chain": ["global", "base-config", "my-function"],
+  "summary": {
+    "errors": 0,
+    "warnings": 1,
+    "info": 0,
+    "total": 1
+  }
+}
+```
+
+#### Validate All Functions
+
+```
+GET /config/validate/all?strict=true
+```
+
+#### Deployment Readiness Check
+
+Performs comprehensive pre-deployment validation:
+
+```
+GET /config/validate/deployment?function=my-function
+```
+
+Response:
+
+```json
+{
+    "ready": true,
+    "function_name": "my-function",
+    "blockers": [],
+    "warnings": [],
+    "resolved_config": {
+        "ENVIRONMENT": "production",
+        "API_KEY": "[REDACTED]"
+    },
+    "checked_at": "2025-12-27T10:00:00Z"
+}
+```
+
+### Validation Rules
+
+The system validates:
+
+| Code                      | Severity | Description                           |
+| ------------------------- | -------- | ------------------------------------- |
+| `CONFIG_NOT_FOUND`        | Error    | Function configuration doesn't exist  |
+| `MISSING_SECRET_REF`      | Error    | Required secret has no reference      |
+| `MISSING_REQUIRED_VALUE`  | Error    | Required env var has no value         |
+| `INVALID_SECRET_SOURCE`   | Error    | Secret references unknown source      |
+| `EMPTY_SECRET_KEY`        | Error    | Secret reference has empty key        |
+| `SECRET_NOT_FOUND`        | Error    | Local secret not found                |
+| `MISSING_PARENT_CONFIG`   | Error    | Inherited config doesn't exist        |
+| `CIRCULAR_INHERITANCE`    | Error    | Circular inheritance detected         |
+| `INVALID_VAR_NAME`        | Error    | Env var name not POSIX-compliant      |
+| `RESERVED_PREFIX`         | Warning  | Uses reserved prefix (GITHUB\_, etc.) |
+| `POTENTIALLY_SENSITIVE`   | Warning  | May contain sensitive data            |
+| `VALUE_TOO_LONG`          | Warning  | Value exceeds 32KB                    |
+| `PROVIDER_NOT_CONFIGURED` | Warning  | Secret provider not configured        |
+| `EMPTY_VALUE`             | Info     | Non-required var has empty value      |
 
 #### Export Configuration (Secrets Redacted)
 
@@ -202,23 +365,6 @@ POST /config/cache/clear
 | `aws`   | AWS Secrets Manager                     |
 | `gcp`   | GCP Secret Manager                      |
 | `azure` | Azure Key Vault                         |
-
-### Configuration Inheritance
-
-Functions can inherit environment variables from parent configurations:
-
-```json
-{
-    "function_name": "my-api-handler",
-    "inherit": ["base-api", "production"]
-}
-```
-
-Variables are resolved in order:
-
-1. Global environment variables
-2. Inherited configurations (in order)
-3. Function-specific variables (override inherited)
 
 ### Usage in Functions
 

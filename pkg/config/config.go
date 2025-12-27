@@ -491,6 +491,10 @@ func (m *Manager) SetSecretRef(functionName, name string, ref *SecretReference) 
 }
 
 // GetEnvVars returns all environment variables for a function, with secrets resolved.
+// Environment variables are resolved in the following order (later overrides earlier):
+// 1. Global environment variables
+// 2. Inherited configuration (in order specified)
+// 3. Function-specific environment variables
 func (m *Manager) GetEnvVars(ctx Context, functionName string) (map[string]string, error) {
 	m.mu.RLock()
 	config, exists := m.configs[functionName]
@@ -499,7 +503,7 @@ func (m *Manager) GetEnvVars(ctx Context, functionName string) (map[string]strin
 
 	result := make(map[string]string)
 
-	// Start with global env vars
+	// Step 1: Start with global env vars
 	for name, envVar := range globalConfig.EnvVars {
 		val, err := m.resolveEnvVar(ctx, functionName, envVar)
 		if err != nil {
@@ -515,18 +519,13 @@ func (m *Manager) GetEnvVars(ctx Context, functionName string) (map[string]strin
 		return result, nil
 	}
 
-	// Handle inheritance
-	for _, parentName := range config.Inherit {
-		parentEnvVars, err := m.GetEnvVars(ctx, parentName)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get inherited env vars from %s: %w", parentName, err)
-		}
-		for k, v := range parentEnvVars {
-			result[k] = v
-		}
+	// Step 2: Handle inheritance (with cycle detection)
+	visited := make(map[string]bool)
+	if err := m.resolveInheritedEnvVars(ctx, config, result, visited); err != nil {
+		return nil, err
 	}
 
-	// Apply function-specific env vars (override inherited)
+	// Step 3: Apply function-specific env vars (override inherited)
 	for name, envVar := range config.EnvVars {
 		val, err := m.resolveEnvVar(ctx, functionName, envVar)
 		if err != nil {
@@ -539,6 +538,157 @@ func (m *Manager) GetEnvVars(ctx Context, functionName string) (map[string]strin
 	}
 
 	return result, nil
+}
+
+// resolveInheritedEnvVars recursively resolves inherited environment variables.
+func (m *Manager) resolveInheritedEnvVars(ctx Context, config *FunctionConfig, result map[string]string, visited map[string]bool) error {
+	if visited[config.FunctionName] {
+		return fmt.Errorf("circular inheritance detected at %s", config.FunctionName)
+	}
+	visited[config.FunctionName] = true
+
+	for _, parentName := range config.Inherit {
+		m.mu.RLock()
+		parentConfig, exists := m.configs[parentName]
+		m.mu.RUnlock()
+
+		if !exists {
+			return fmt.Errorf("inherited config %s not found", parentName)
+		}
+
+		// Recursively resolve parent's inherited configs first
+		if err := m.resolveInheritedEnvVars(ctx, parentConfig, result, visited); err != nil {
+			return err
+		}
+
+		// Then apply parent's own env vars
+		for name, envVar := range parentConfig.EnvVars {
+			val, err := m.resolveEnvVar(ctx, parentName, envVar)
+			if err != nil {
+				if envVar.Required {
+					return fmt.Errorf("failed to resolve required env var %s from %s: %w", name, parentName, err)
+				}
+				continue
+			}
+			result[name] = val
+		}
+	}
+
+	return nil
+}
+
+// GetGlobalConfig returns the global configuration.
+func (m *Manager) GetGlobalConfig() *GlobalConfig {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.globalConfig
+}
+
+// SetInheritance sets the inheritance chain for a function.
+func (m *Manager) SetInheritance(functionName string, parents []string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	config, exists := m.configs[functionName]
+	if !exists {
+		return ErrFunctionNotFound
+	}
+
+	// Validate that all parents exist
+	for _, parent := range parents {
+		if _, parentExists := m.configs[parent]; !parentExists {
+			return fmt.Errorf("parent config %s not found", parent)
+		}
+	}
+
+	// Check for circular inheritance
+	if err := m.checkCircularInheritance(functionName, parents); err != nil {
+		return err
+	}
+
+	config.Inherit = parents
+	config.UpdatedAt = time.Now()
+	config.Version++
+
+	m.logger.Info("inheritance set", logging.Fields{
+		"function_name": functionName,
+		"parents":       parents,
+	})
+
+	if m.autoSave && m.configFile != "" {
+		return m.saveToFileUnlocked(m.configFile)
+	}
+	return nil
+}
+
+// checkCircularInheritance checks if adding the given parents would create a cycle.
+func (m *Manager) checkCircularInheritance(functionName string, newParents []string) error {
+	visited := make(map[string]bool)
+
+	var check func(name string) error
+	check = func(name string) error {
+		if name == functionName {
+			return fmt.Errorf("circular inheritance detected: %s would create a cycle", name)
+		}
+		if visited[name] {
+			return nil
+		}
+		visited[name] = true
+
+		config, exists := m.configs[name]
+		if !exists {
+			return nil
+		}
+
+		for _, parent := range config.Inherit {
+			if err := check(parent); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	for _, parent := range newParents {
+		if err := check(parent); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// GetInheritanceChain returns the full inheritance chain for a function.
+func (m *Manager) GetInheritanceChain(functionName string) ([]string, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	config, exists := m.configs[functionName]
+	if !exists {
+		return nil, ErrFunctionNotFound
+	}
+
+	chain := []string{"global"}
+	visited := make(map[string]bool)
+	m.buildInheritanceChainRecursive(config, &chain, visited)
+	chain = append(chain, functionName)
+
+	return chain, nil
+}
+
+func (m *Manager) buildInheritanceChainRecursive(config *FunctionConfig, chain *[]string, visited map[string]bool) {
+	if visited[config.FunctionName] {
+		return
+	}
+	visited[config.FunctionName] = true
+
+	for _, parentName := range config.Inherit {
+		parentConfig, exists := m.configs[parentName]
+		if !exists {
+			continue
+		}
+		m.buildInheritanceChainRecursive(parentConfig, chain, visited)
+		*chain = append(*chain, parentName)
+	}
 }
 
 // GetSecret retrieves a specific secret value.

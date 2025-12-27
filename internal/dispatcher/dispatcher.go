@@ -7,6 +7,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/github-lambda/pkg/logging"
+	"github.com/github-lambda/pkg/metrics"
 	"github.com/google/go-github/v57/github"
 	"golang.org/x/oauth2"
 )
@@ -18,6 +20,7 @@ type Dispatcher struct {
 	repo       string
 	mu         sync.RWMutex
 	executions map[string]*Execution
+	logger     *logging.Logger
 }
 
 // Execution represents a running or completed function execution.
@@ -49,11 +52,14 @@ func New(token, owner, repo string) *Dispatcher {
 		&oauth2.Token{AccessToken: token},
 	)
 	tc := oauth2.NewClient(ctx, ts)
+logger := logging.New("dispatcher")
 
 	return &Dispatcher{
 		client:     github.NewClient(tc),
 		owner:      owner,
 		repo:       repo,
+		executions: make(map[string]*Execution),
+		logger:     logger,
 		executions: make(map[string]*Execution),
 	}
 }
@@ -69,8 +75,7 @@ type InvokeRequest struct {
 func (d *Dispatcher) Invoke(ctx context.Context, req InvokeRequest) (*Execution, error) {
 	exec, err := d.InvokeAsync(ctx, req)
 	if err != nil {
-		return nil, err
-	}
+	logger := d.logger.WithInvocation(exec.ID, req.FunctionName)
 
 	// Poll for completion
 	ticker := time.NewTicker(2 * time.Second)
@@ -87,6 +92,11 @@ func (d *Dispatcher) Invoke(ctx context.Context, req InvokeRequest) (*Execution,
 	for {
 		select {
 		case <-timeoutCtx.Done():
+			durationMs := float64(time.Since(exec.StartedAt).Milliseconds())
+			metrics.InvocationTimeout(req.FunctionName, durationMs)
+			logger.Warn("invocation timed out", logging.Fields{
+				"duration_ms": int64(durationMs),
+			})
 			return nil, fmt.Errorf("execution timed out")
 		case <-ticker.C:
 			exec, err = d.GetExecution(exec.ID)
@@ -94,15 +104,17 @@ func (d *Dispatcher) Invoke(ctx context.Context, req InvokeRequest) (*Execution,
 				return nil, err
 			}
 			if exec.Status == StatusCompleted || exec.Status == StatusFailed {
-				return exec, nil
-			}
-		}
-	}
-}
+				durationMs := float64(time.Since(exec.StartedAt).Milliseconds())
+				if exec.Status == StatusCompleted {
+					metrics.InvocationCompleted(req.FunctionName, durationMs)
+					logger.Info("invocation completed", logging.Fields{
+						"duration_ms": int64(durationMs),
+					})
+	logger := d.logger.WithInvocation(invocationID, req.FunctionName)
+	logger.Info("starting invocation")
 
-// InvokeAsync triggers a workflow without waiting for completion.
-func (d *Dispatcher) InvokeAsync(ctx context.Context, req InvokeRequest) (*Execution, error) {
-	invocationID := generateID()
+	// Track metrics
+	metrics.InvocationStarted(req.FunctionName)
 
 	exec := &Execution{
 		ID:           invocationID,
@@ -117,6 +129,34 @@ func (d *Dispatcher) InvokeAsync(ctx context.Context, req InvokeRequest) (*Execu
 
 	// Trigger workflow_dispatch event
 	payload, _ := json.Marshal(map[string]string{
+		"function_name": req.FunctionName,
+		"invocation_id": invocationID,
+		"payload":       string(req.Payload),
+	})
+
+	_, _, err := d.client.Repositories.CreateRepositoryDispatch(
+		ctx,
+		d.owner,
+		d.repo,
+		github.DispatchRequestOptions{
+			EventType:     "lambda-invoke",
+			ClientPayload: (*json.RawMessage)(&payload),
+		},
+	)
+	if err != nil {
+		exec.Status = StatusFailed
+		exec.Error = err.Error()
+		durationMs := float64(time.Since(exec.StartedAt).Milliseconds())
+		metrics.InvocationFailed(req.FunctionName, durationMs)
+		logger.Error("failed to dispatch workflow", logging.Fields{
+			"error":       err.Error(),
+			"duration_ms": int64(durationMs),
+		})
+		return exec, fmt.Errorf("failed to dispatch workflow: %w", err)
+	}
+
+	exec.Status = StatusRunning
+	logger.Debug("workflow dispatched successfully", logging.Fields{
 		"function_name": req.FunctionName,
 		"invocation_id": invocationID,
 		"payload":       string(req.Payload),

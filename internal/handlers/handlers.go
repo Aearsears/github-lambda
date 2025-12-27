@@ -12,6 +12,7 @@ import (
 	"github.com/github-lambda/internal/dispatcher"
 	"github.com/github-lambda/pkg/auth"
 	"github.com/github-lambda/pkg/cache"
+	"github.com/github-lambda/pkg/config"
 	"github.com/github-lambda/pkg/dlq"
 	"github.com/github-lambda/pkg/logging"
 	"github.com/github-lambda/pkg/metrics"
@@ -23,6 +24,11 @@ var logger = logging.New("handlers")
 
 // InvokeHandler handles synchronous function invocations.
 func InvokeHandler(d *dispatcher.Dispatcher, limiter *ratelimit.Limiter, resolver *versioning.Resolver, retryer *dlq.Retryer, dlqQueue *dlq.Queue, resultCache *cache.Cache) http.HandlerFunc {
+	return InvokeHandlerWithConfig(d, limiter, resolver, retryer, dlqQueue, resultCache, nil)
+}
+
+// InvokeHandlerWithConfig handles synchronous function invocations with configuration injection.
+func InvokeHandlerWithConfig(d *dispatcher.Dispatcher, limiter *ratelimit.Limiter, resolver *versioning.Resolver, retryer *dlq.Retryer, dlqQueue *dlq.Queue, resultCache *cache.Cache, configManager *config.Manager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -119,6 +125,22 @@ func InvokeHandler(d *dispatcher.Dispatcher, limiter *ratelimit.Limiter, resolve
 		// Set version in request for dispatcher
 		req.Version = resolvedVersion
 
+		// Inject environment variables from configuration if manager is available
+		if configManager != nil {
+			envVars, err := configManager.GetEnvVars(r.Context(), req.FunctionName)
+			if err != nil {
+				logger.Debug("no env vars configured for function", logging.Fields{
+					"function_name": req.FunctionName,
+				})
+			} else if len(envVars) > 0 {
+				req.EnvVars = envVars
+				logger.Debug("injected env vars", logging.Fields{
+					"function_name": req.FunctionName,
+					"env_var_count": len(envVars),
+				})
+			}
+		}
+
 		// Execute with retry support if retryer is provided
 		var exec *dispatcher.Execution
 		var finalErr error
@@ -207,6 +229,11 @@ func InvokeHandler(d *dispatcher.Dispatcher, limiter *ratelimit.Limiter, resolve
 
 // AsyncInvokeHandler handles asynchronous function invocations.
 func AsyncInvokeHandler(d *dispatcher.Dispatcher, limiter *ratelimit.Limiter, resolver *versioning.Resolver, retryer *dlq.Retryer, dlqQueue *dlq.Queue) http.HandlerFunc {
+	return AsyncInvokeHandlerWithConfig(d, limiter, resolver, retryer, dlqQueue, nil)
+}
+
+// AsyncInvokeHandlerWithConfig handles asynchronous function invocations with configuration injection.
+func AsyncInvokeHandlerWithConfig(d *dispatcher.Dispatcher, limiter *ratelimit.Limiter, resolver *versioning.Resolver, retryer *dlq.Retryer, dlqQueue *dlq.Queue, configManager *config.Manager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -277,6 +304,22 @@ func AsyncInvokeHandler(d *dispatcher.Dispatcher, limiter *ratelimit.Limiter, re
 
 		// Set version in request for dispatcher
 		req.Version = resolvedVersion
+
+		// Inject environment variables from configuration if manager is available
+		if configManager != nil {
+			envVars, err := configManager.GetEnvVars(r.Context(), req.FunctionName)
+			if err != nil {
+				logger.Debug("no env vars configured for function", logging.Fields{
+					"function_name": req.FunctionName,
+				})
+			} else if len(envVars) > 0 {
+				req.EnvVars = envVars
+				logger.Debug("injected env vars", logging.Fields{
+					"function_name": req.FunctionName,
+					"env_var_count": len(envVars),
+				})
+			}
+		}
 
 		exec, err := d.InvokeAsync(r.Context(), req)
 		if err != nil {

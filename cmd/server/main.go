@@ -11,6 +11,7 @@ import (
 	"github.com/github-lambda/internal/handlers"
 	"github.com/github-lambda/pkg/auth"
 	"github.com/github-lambda/pkg/cache"
+	"github.com/github-lambda/pkg/config"
 	"github.com/github-lambda/pkg/dlq"
 	"github.com/github-lambda/pkg/events"
 	"github.com/github-lambda/pkg/logging"
@@ -214,6 +215,47 @@ func main() {
 		"default_ttl": cacheDefaultTTL.String(),
 	})
 
+	// Initialize configuration manager
+	configOpts := config.DefaultManagerOptions()
+	if encKey := os.Getenv("CONFIG_ENCRYPTION_KEY"); encKey != "" {
+		configOpts.EncryptionKey = encKey
+	}
+	if configFile := os.Getenv("CONFIG_FILE"); configFile != "" {
+		configOpts.ConfigFile = configFile
+	}
+
+	configManager, err := config.NewManager(configOpts)
+	if err != nil {
+		logger.Warn("failed to initialize config manager", logging.Fields{"error": err.Error()})
+	} else {
+		logger.Info("configuration manager initialized", logging.Fields{
+			"config_file": configOpts.ConfigFile,
+		})
+
+		// Register Vault provider if configured
+		if os.Getenv("VAULT_ADDR") != "" {
+			vaultProvider, err := config.NewVaultProviderFromEnv()
+			if err != nil {
+				logger.Warn("failed to initialize Vault provider", logging.Fields{"error": err.Error()})
+			} else {
+				configManager.RegisterProvider(config.SecretSourceVault, vaultProvider)
+				logger.Info("Vault secret provider registered")
+			}
+		}
+
+		// Register GitHub Secrets provider
+		if ghProvider, err := config.NewGitHubSecretsProviderFromEnv(); err == nil {
+			configManager.RegisterProvider(config.SecretSource("github"), ghProvider)
+			logger.Info("GitHub secrets provider registered")
+		}
+	}
+
+	// Initialize configuration HTTP handlers
+	var configHandler *config.Handlers
+	if configManager != nil {
+		configHandler = config.NewHandlers(configManager)
+	}
+
 	// Initialize admin handler
 	adminHandler := auth.NewAdminHandler(keyStore)
 
@@ -245,6 +287,24 @@ func main() {
 
 	// Cache routes
 	cacheHandler.RegisterRoutes(mux)
+
+	// Configuration management routes
+	if configHandler != nil {
+		mux.HandleFunc("/config", configHandler.GetConfigHandler())
+		mux.HandleFunc("/config/functions", configHandler.ListFunctionsHandler())
+		mux.HandleFunc("/config/functions/", configHandler.GetConfigHandler())
+		mux.HandleFunc("/config/function", configHandler.CreateFunctionConfigHandler())
+		mux.HandleFunc("/config/function/delete", configHandler.DeleteFunctionConfigHandler())
+		mux.HandleFunc("/config/env", configHandler.SetEnvVarHandler())
+		mux.HandleFunc("/config/env/delete", configHandler.DeleteEnvVarHandler())
+		mux.HandleFunc("/config/env/global", configHandler.SetGlobalEnvVarHandler())
+		mux.HandleFunc("/config/secret", configHandler.SetEnvVarHandler())
+		mux.HandleFunc("/config/secret/ref", configHandler.SetSecretRefHandler())
+		mux.HandleFunc("/config/validate", configHandler.ValidateConfigHandler())
+		mux.HandleFunc("/config/export", configHandler.ExportConfigHandler())
+		mux.HandleFunc("/config/cache/clear", configHandler.ClearCacheHandler())
+		logger.Info("configuration management routes registered")
+	}
 
 	// Determine if auth is enabled
 	authEnabled := os.Getenv("AUTH_DISABLED") != "true"

@@ -39,20 +39,6 @@ Using GitHub Actions as Lambda Functions
 -   Encryption at rest and in transit
 -   Resource policies for function access
 
-**3. Dead Letter Queue (DLQ)**
-
--   Capture failed invocations after max retries
--   Store failed events for replay/analysis
--   Configurable retry policies with exponential backoff
--   Error categorization (retriable vs. permanent failures)
-
-**4. Result Caching**
-
--   Cache successful function responses by input hash
--   Configurable TTL per function
--   Cache invalidation API
--   Reduce redundant executions for idempotent operations
-
 **7. Environment & Configuration Management**
 
 -   Per-function environment variables stored securely

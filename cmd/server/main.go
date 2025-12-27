@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"net/http"
 	"os"
 	"strconv"
@@ -8,6 +9,7 @@ import (
 	"github.com/github-lambda/internal/dispatcher"
 	"github.com/github-lambda/internal/handlers"
 	"github.com/github-lambda/pkg/auth"
+	"github.com/github-lambda/pkg/dlq"
 	"github.com/github-lambda/pkg/events"
 	"github.com/github-lambda/pkg/logging"
 	"github.com/github-lambda/pkg/metrics"
@@ -132,6 +134,58 @@ func main() {
 	// Initialize versioning HTTP handler
 	versioningHandler := versioning.NewHTTPHandler(versionManager)
 
+	// Initialize Dead Letter Queue
+	dlqConfig := dlq.DefaultConfig()
+	if maxSize := os.Getenv("DLQ_MAX_SIZE"); maxSize != "" {
+		if v, err := strconv.Atoi(maxSize); err == nil {
+			dlqConfig.MaxSize = v
+		}
+	}
+	if retention := os.Getenv("DLQ_RETENTION_DAYS"); retention != "" {
+		if v, err := strconv.Atoi(retention); err == nil {
+			dlqConfig.RetentionDays = v
+		}
+	}
+
+	dlqQueue := dlq.NewQueue(dlqConfig)
+
+	// Load DLQ state from file if configured
+	if dlqFile := os.Getenv("DLQ_FILE"); dlqFile != "" {
+		if err := dlqQueue.LoadFromFile(dlqFile); err != nil {
+			logger.Warn("failed to load DLQ file", logging.Fields{"error": err.Error()})
+		}
+	}
+
+	// Initialize retryer with default policy
+	retryPolicy := dlq.DefaultRetryPolicy()
+	if maxRetries := os.Getenv("DLQ_MAX_RETRIES"); maxRetries != "" {
+		if v, err := strconv.Atoi(maxRetries); err == nil {
+			retryPolicy.MaxRetries = v
+		}
+	}
+
+	retryer := dlq.NewRetryer(dlqQueue, retryPolicy)
+
+	// Initialize DLQ HTTP handler
+	dlqHandler := dlq.NewHTTPHandler(dlqQueue, retryer)
+
+	// Set up replay function
+	dlqHandler.SetReplayFunc(func(event *dlq.FailedEvent) error {
+		req := dispatcher.InvokeRequest{
+			FunctionName: event.FunctionName,
+			Version:      event.Version,
+			Payload:      event.Payload,
+		}
+		_, err := d.InvokeAsync(context.Background(), req)
+		return err
+	})
+
+	logger.Info("DLQ configured", logging.Fields{
+		"max_size":       dlqConfig.MaxSize,
+		"retention_days": dlqConfig.RetentionDays,
+		"max_retries":    retryPolicy.MaxRetries,
+	})
+
 	// Initialize admin handler
 	adminHandler := auth.NewAdminHandler(keyStore)
 
@@ -144,8 +198,8 @@ func main() {
 	mux.HandleFunc("/ratelimit/stats", rateLimitMiddleware.Handler())
 
 	// Protected routes
-	mux.HandleFunc("/invoke", handlers.InvokeHandler(d, limiter, versionResolver))
-	mux.HandleFunc("/invoke/async", handlers.AsyncInvokeHandler(d, limiter, versionResolver))
+	mux.HandleFunc("/invoke", handlers.InvokeHandler(d, limiter, versionResolver, retryer, dlqQueue))
+	mux.HandleFunc("/invoke/async", handlers.AsyncInvokeHandler(d, limiter, versionResolver, retryer, dlqQueue))
 	mux.HandleFunc("/status/", handlers.StatusHandler(d))
 	mux.HandleFunc("/callback", handlers.CallbackHandler(d, authMiddleware))
 
@@ -157,6 +211,9 @@ func main() {
 
 	// Versioning routes (require admin permission)
 	versioningHandler.RegisterRoutes(mux)
+
+	// DLQ routes
+	dlqHandler.RegisterRoutes(mux)
 
 	// Determine if auth is enabled
 	authEnabled := os.Getenv("AUTH_DISABLED") != "true"

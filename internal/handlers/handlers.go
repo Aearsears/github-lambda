@@ -1,7 +1,9 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -9,6 +11,7 @@ import (
 
 	"github.com/github-lambda/internal/dispatcher"
 	"github.com/github-lambda/pkg/auth"
+	"github.com/github-lambda/pkg/dlq"
 	"github.com/github-lambda/pkg/logging"
 	"github.com/github-lambda/pkg/metrics"
 	"github.com/github-lambda/pkg/ratelimit"
@@ -18,13 +21,14 @@ import (
 var logger = logging.New("handlers")
 
 // InvokeHandler handles synchronous function invocations.
-func InvokeHandler(d *dispatcher.Dispatcher, limiter *ratelimit.Limiter, resolver *versioning.Resolver) http.HandlerFunc {
+func InvokeHandler(d *dispatcher.Dispatcher, limiter *ratelimit.Limiter, resolver *versioning.Resolver, retryer *dlq.Retryer, dlqQueue *dlq.Queue) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 
+		startTime := time.Now()
 		var req dispatcher.InvokeRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			logger.Warn("invalid request body", logging.Fields{"error": err.Error()})
@@ -36,6 +40,8 @@ func InvokeHandler(d *dispatcher.Dispatcher, limiter *ratelimit.Limiter, resolve
 			http.Error(w, "function_name is required", http.StatusBadRequest)
 			return
 		}
+
+		originalFunctionName := req.FunctionName
 
 		// Resolve version/alias if resolver is provided
 		var resolvedVersion int
@@ -90,9 +96,57 @@ func InvokeHandler(d *dispatcher.Dispatcher, limiter *ratelimit.Limiter, resolve
 		// Set version in request for dispatcher
 		req.Version = resolvedVersion
 
-		exec, err := d.Invoke(r.Context(), req)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+		// Execute with retry support if retryer is provided
+		var exec *dispatcher.Execution
+		var finalErr error
+
+		if retryer != nil {
+			result := retryer.ExecuteWithRetry(r.Context(), req.FunctionName, func(ctx context.Context) (interface{}, error) {
+				return d.Invoke(ctx, req)
+			}, dlq.ClassifyError)
+
+			if result.Success {
+				exec = result.Result.(*dispatcher.Execution)
+			} else {
+				finalErr = result.FinalError
+
+				// Send to DLQ on failure
+				if dlqQueue != nil {
+					failedEvent := &dlq.FailedEvent{
+						InvocationID:  fmt.Sprintf("invoke-%d", time.Now().UnixNano()),
+						FunctionName:  req.FunctionName,
+						Version:       resolvedVersion,
+						Alias:         resolvedAlias,
+						Payload:       req.Payload,
+						ErrorMessage:  finalErr.Error(),
+						ErrorType:     dlq.ClassifyError(finalErr).GetErrorType(),
+						FailureReason: dlq.ClassifyError(finalErr),
+						RetryAttempts: result.Attempts,
+						MaxRetries:    retryer.GetPolicy(req.FunctionName).MaxRetries,
+						RetryHistory:  result.RetryHistory,
+						OriginalTime:  startTime,
+						FailedTime:    time.Now(),
+						Source:        "http",
+						Metadata: map[string]string{
+							"original_function": originalFunctionName,
+							"remote_addr":       r.RemoteAddr,
+						},
+					}
+					if err := dlqQueue.Add(failedEvent); err != nil {
+						logger.Error("failed to add event to DLQ", logging.Fields{"error": err.Error()})
+					}
+				}
+			}
+		} else {
+			exec, finalErr = d.Invoke(r.Context(), req)
+		}
+
+		if finalErr != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{
+				"error": finalErr.Error(),
+			})
 			return
 		}
 
@@ -102,7 +156,7 @@ func InvokeHandler(d *dispatcher.Dispatcher, limiter *ratelimit.Limiter, resolve
 }
 
 // AsyncInvokeHandler handles asynchronous function invocations.
-func AsyncInvokeHandler(d *dispatcher.Dispatcher, limiter *ratelimit.Limiter, resolver *versioning.Resolver) http.HandlerFunc {
+func AsyncInvokeHandler(d *dispatcher.Dispatcher, limiter *ratelimit.Limiter, resolver *versioning.Resolver, retryer *dlq.Retryer, dlqQueue *dlq.Queue) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)

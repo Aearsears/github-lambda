@@ -8,6 +8,7 @@ import (
 	"github.com/github-lambda/internal/dispatcher"
 	"github.com/github-lambda/internal/handlers"
 	"github.com/github-lambda/pkg/auth"
+	"github.com/github-lambda/pkg/events"
 	"github.com/github-lambda/pkg/logging"
 	"github.com/github-lambda/pkg/metrics"
 	"github.com/github-lambda/pkg/ratelimit"
@@ -102,6 +103,18 @@ func main() {
 	// Initialize the dispatcher with logging
 	d := dispatcher.New(githubToken, repoOwner, repoName)
 
+	// Initialize event source manager
+	eventManager := events.NewManager(d)
+
+	// Initialize event HTTP handler
+	eventHandler := events.NewHTTPHandler(eventManager)
+
+	// Start scheduler if not disabled
+	if os.Getenv("SCHEDULER_DISABLED") != "true" {
+		eventManager.StartScheduler()
+		logger.Info("event scheduler started")
+	}
+
 	// Initialize admin handler
 	adminHandler := auth.NewAdminHandler(keyStore)
 
@@ -121,6 +134,9 @@ func main() {
 
 	// Admin routes (require admin permission)
 	adminHandler.RegisterRoutes(mux)
+
+	// Event source routes
+	eventHandler.RegisterRoutes(mux)
 
 	// Determine if auth is enabled
 	authEnabled := os.Getenv("AUTH_DISABLED") != "true"

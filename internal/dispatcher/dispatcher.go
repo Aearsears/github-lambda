@@ -52,7 +52,7 @@ func New(token, owner, repo string) *Dispatcher {
 		&oauth2.Token{AccessToken: token},
 	)
 	tc := oauth2.NewClient(ctx, ts)
-logger := logging.New("dispatcher")
+	logger := logging.New("dispatcher")
 
 	return &Dispatcher{
 		client:     github.NewClient(tc),
@@ -60,7 +60,6 @@ logger := logging.New("dispatcher")
 		repo:       repo,
 		executions: make(map[string]*Execution),
 		logger:     logger,
-		executions: make(map[string]*Execution),
 	}
 }
 
@@ -75,6 +74,9 @@ type InvokeRequest struct {
 func (d *Dispatcher) Invoke(ctx context.Context, req InvokeRequest) (*Execution, error) {
 	exec, err := d.InvokeAsync(ctx, req)
 	if err != nil {
+		return nil, err
+	}
+
 	logger := d.logger.WithInvocation(exec.ID, req.FunctionName)
 
 	// Poll for completion
@@ -110,6 +112,22 @@ func (d *Dispatcher) Invoke(ctx context.Context, req InvokeRequest) (*Execution,
 					logger.Info("invocation completed", logging.Fields{
 						"duration_ms": int64(durationMs),
 					})
+				} else {
+					metrics.InvocationFailed(req.FunctionName, durationMs)
+					logger.Error("invocation failed", logging.Fields{
+						"error":       exec.Error,
+						"duration_ms": int64(durationMs),
+					})
+				}
+				return exec, nil
+			}
+		}
+	}
+}
+
+// InvokeAsync triggers a workflow without waiting for completion.
+func (d *Dispatcher) InvokeAsync(ctx context.Context, req InvokeRequest) (*Execution, error) {
+	invocationID := generateID()
 	logger := d.logger.WithInvocation(invocationID, req.FunctionName)
 	logger.Info("starting invocation")
 
@@ -127,7 +145,7 @@ func (d *Dispatcher) Invoke(ctx context.Context, req InvokeRequest) (*Execution,
 	d.executions[invocationID] = exec
 	d.mu.Unlock()
 
-	// Trigger workflow_dispatch event
+	// Trigger repository_dispatch event
 	payload, _ := json.Marshal(map[string]string{
 		"function_name": req.FunctionName,
 		"invocation_id": invocationID,
@@ -159,25 +177,8 @@ func (d *Dispatcher) Invoke(ctx context.Context, req InvokeRequest) (*Execution,
 	logger.Debug("workflow dispatched successfully", logging.Fields{
 		"function_name": req.FunctionName,
 		"invocation_id": invocationID,
-		"payload":       string(req.Payload),
 	})
 
-	_, _, err := d.client.Repositories.CreateRepositoryDispatch(
-		ctx,
-		d.owner,
-		d.repo,
-		github.DispatchRequestOptions{
-			EventType:     "lambda-invoke",
-			ClientPayload: (*json.RawMessage)(&payload),
-		},
-	)
-	if err != nil {
-		exec.Status = StatusFailed
-		exec.Error = err.Error()
-		return exec, fmt.Errorf("failed to dispatch workflow: %w", err)
-	}
-
-	exec.Status = StatusRunning
 	return exec, nil
 }
 
@@ -213,6 +214,32 @@ func (d *Dispatcher) UpdateExecution(id string, status ExecutionStatus, result j
 	}
 
 	return nil
+}
+
+// ListExecutions lists recent executions.
+func (d *Dispatcher) ListExecutions(limit int) []*Execution {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	executions := make([]*Execution, 0, len(d.executions))
+	for _, exec := range d.executions {
+		executions = append(executions, exec)
+	}
+
+	// Sort by started_at descending (most recent first)
+	for i := 0; i < len(executions)-1; i++ {
+		for j := i + 1; j < len(executions); j++ {
+			if executions[j].StartedAt.After(executions[i].StartedAt) {
+				executions[i], executions[j] = executions[j], executions[i]
+			}
+		}
+	}
+
+	if limit > 0 && limit < len(executions) {
+		executions = executions[:limit]
+	}
+
+	return executions
 }
 
 // generateID creates a unique invocation ID.

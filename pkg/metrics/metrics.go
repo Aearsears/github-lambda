@@ -328,7 +328,7 @@ func InvocationTimeout(functionName string, durationMs float64) {
 	Default.InvocationTimeout(functionName, durationMs)
 }
 
-// Snapshot returns a point-in-time snapshot of all metrics.
-func Snapshot() Snapshot {
+// GetSnapshot returns a point-in-time snapshot of all metrics.
+func GetSnapshot() Snapshot {
 	return Default.Snapshot()
 }

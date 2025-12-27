@@ -25,7 +25,14 @@ type Context struct {
 // NewContext creates a new lambda context.
 func NewContext(parent context.Context, invocationID, functionName string, timeout time.Duration) *Context {
 	deadline := time.Now().Add(timeout)
-	ctx, _ := context.WithDeadline(parent, deadline)
+	ctx, cancel := context.WithDeadline(parent, deadline)
+
+	// Store cancel function for cleanup - in practice, the context will be
+	// canceled when the function execution completes or times out
+	go func() {
+		<-ctx.Done()
+		cancel()
+	}()
 
 	return &Context{
 		Context:      ctx,

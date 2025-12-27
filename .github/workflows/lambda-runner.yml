@@ -42,28 +42,54 @@ jobs:
               if: success()
               env:
                   CALLBACK_URL: ${{ secrets.LAMBDA_CALLBACK_URL }}
+                  CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
               run: |
                   if [ -n "$CALLBACK_URL" ]; then
-                    curl -X POST "$CALLBACK_URL/callback" \
-                      -H "Content-Type: application/json" \
-                      -d '{
-                        "invocation_id": "${{ steps.info.outputs.invocation_id }}",
-                        "status": "completed",
-                        "result": ${{ steps.run.outputs.result || '{}' }}
-                      }'
+                    PAYLOAD='{
+                      "invocation_id": "${{ steps.info.outputs.invocation_id }}",
+                      "function_name": "${{ steps.info.outputs.function_name }}",
+                      "status": "completed",
+                      "result": ${{ steps.run.outputs.result || '{}' }}
+                    }'
+                    
+                    # Generate HMAC signature if secret is configured
+                    if [ -n "$CALLBACK_SECRET" ]; then
+                      SIGNATURE=$(echo -n "$PAYLOAD" | openssl dgst -sha256 -hmac "$CALLBACK_SECRET" | sed 's/^.* //')
+                      curl -X POST "$CALLBACK_URL/callback" \
+                        -H "Content-Type: application/json" \
+                        -H "X-Lambda-Signature: sha256=$SIGNATURE" \
+                        -d "$PAYLOAD"
+                    else
+                      curl -X POST "$CALLBACK_URL/callback" \
+                        -H "Content-Type: application/json" \
+                        -d "$PAYLOAD"
+                    fi
                   fi
 
             - name: Report failure
               if: failure()
               env:
                   CALLBACK_URL: ${{ secrets.LAMBDA_CALLBACK_URL }}
+                  CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
               run: |
                   if [ -n "$CALLBACK_URL" ]; then
-                    curl -X POST "$CALLBACK_URL/callback" \
-                      -H "Content-Type: application/json" \
-                      -d '{
-                        "invocation_id": "${{ steps.info.outputs.invocation_id }}",
-                        "status": "failed",
-                        "error": "Function execution failed"
-                      }'
+                    PAYLOAD='{
+                      "invocation_id": "${{ steps.info.outputs.invocation_id }}",
+                      "function_name": "${{ steps.info.outputs.function_name }}",
+                      "status": "failed",
+                      "error": "Function execution failed"
+                    }'
+                    
+                    # Generate HMAC signature if secret is configured
+                    if [ -n "$CALLBACK_SECRET" ]; then
+                      SIGNATURE=$(echo -n "$PAYLOAD" | openssl dgst -sha256 -hmac "$CALLBACK_SECRET" | sed 's/^.* //')
+                      curl -X POST "$CALLBACK_URL/callback" \
+                        -H "Content-Type: application/json" \
+                        -H "X-Lambda-Signature: sha256=$SIGNATURE" \
+                        -d "$PAYLOAD"
+                    else
+                      curl -X POST "$CALLBACK_URL/callback" \
+                        -H "Content-Type: application/json" \
+                        -d "$PAYLOAD"
+                    fi
                   fi

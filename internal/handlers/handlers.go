@@ -2,11 +2,13 @@ package handlers
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/github-lambda/internal/dispatcher"
+	"github.com/github-lambda/pkg/auth"
 	"github.com/github-lambda/pkg/logging"
 	"github.com/github-lambda/pkg/metrics"
 )
@@ -30,6 +32,16 @@ func InvokeHandler(d *dispatcher.Dispatcher) http.HandlerFunc {
 
 		if req.FunctionName == "" {
 			http.Error(w, "function_name is required", http.StatusBadRequest)
+			return
+		}
+
+		// Check function-level access
+		if err := auth.RequireFunctionAccess(req.FunctionName, r); err != nil {
+			logger.Warn("function access denied", logging.Fields{
+				"function_name": req.FunctionName,
+				"error":         err.Error(),
+			})
+			http.Error(w, `{"error": "access denied for function"}`, http.StatusForbidden)
 			return
 		}
 
@@ -65,6 +77,16 @@ func AsyncInvokeHandler(d *dispatcher.Dispatcher) http.HandlerFunc {
 
 		if req.FunctionName == "" {
 			http.Error(w, "function_name is required", http.StatusBadRequest)
+			return
+		}
+
+		// Check function-level access
+		if err := auth.RequireFunctionAccess(req.FunctionName, r); err != nil {
+			logger.Warn("function access denied", logging.Fields{
+				"function_name": req.FunctionName,
+				"error":         err.Error(),
+			})
+			http.Error(w, `{"error": "access denied for function"}`, http.StatusForbidden)
 			return
 		}
 
@@ -120,10 +142,26 @@ func HealthHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // CallbackHandler handles workflow completion callbacks.
-func CallbackHandler(d *dispatcher.Dispatcher) http.HandlerFunc {
+func CallbackHandler(d *dispatcher.Dispatcher, authMiddleware *auth.Middleware) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		// Read the body for signature verification
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "Failed to read request body", http.StatusBadRequest)
+			return
+		}
+
+		// Verify callback signature if configured
+		if !authMiddleware.VerifyCallbackSignature(r, body) {
+			logger.Warn("invalid callback signature", logging.Fields{
+				"ip": r.RemoteAddr,
+			})
+			http.Error(w, `{"error": "invalid signature"}`, http.StatusUnauthorized)
 			return
 		}
 
@@ -136,7 +174,7 @@ func CallbackHandler(d *dispatcher.Dispatcher) http.HandlerFunc {
 			DurationMs   float64         `json:"duration_ms,omitempty"`
 		}
 
-		if err := json.NewDecoder(r.Body).Decode(&callback); err != nil {
+		if err := json.Unmarshal(body, &callback); err != nil {
 			logger.Warn("invalid callback request", logging.Fields{"error": err.Error()})
 			http.Error(w, "Invalid request body", http.StatusBadRequest)
 			return

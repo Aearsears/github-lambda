@@ -39,19 +39,13 @@ Using GitHub Actions as Lambda Functions
 -   Encryption at rest and in transit
 -   Resource policies for function access
 
-**9. Cold Start Optimization**
-
--   Cached dependency layers
--   Function image prebuilding
-    **10. Environment & Configuration Management**
+## Environment & Configuration Management
 
 -   Per-function environment variables stored securely
 -   Secret management integration (Vault, AWS, GCP, Azure)
 -   Configuration inheritance between functions
 -   Encrypted local secret storage (AES-256-GCM)
 -   Secret caching with configurable TTL
-
-## Environment & Configuration Management
 
 The configuration management system provides secure per-function environment variables and integrates with popular secret management services.
 
@@ -401,3 +395,330 @@ In your GitHub Actions workflow, access these variables:
 3. **Access Control**: Configuration endpoints require admin permissions
 4. **Audit Logging**: All secret access is logged
 5. **Cache TTL**: Adjust secret cache TTL based on security requirements
+
+## Cold Start Optimization
+
+The cold start optimization system provides cached dependency layers and function image prebuilding using GitHub Actions cache.
+
+### Configuration
+
+Set the following environment variables:
+
+```bash
+# Warm pool configuration
+WARMPOOL_FILE=/path/to/warmpool.json       # Persistence file
+WARMPOOL_MAX_SIZE=100                       # Maximum warm instances
+WARMPOOL_ARTIFACT_DIR=.lambda-cache         # Artifact storage directory
+
+# Prebuild configuration
+PREBUILD_QUEUE_SIZE=100                     # Build queue size
+
+# Disable cold start optimization (not recommended for production)
+COLDSTART_DISABLED=true
+```
+
+### Warm Pool Management
+
+The warm pool keeps function instances pre-warmed for faster cold starts.
+
+#### Register Function for Warm Pool
+
+```
+POST /api/warmpool/functions
+Content-Type: application/json
+
+{
+  "name": "my-function",
+  "runtime": "python",
+  "runtime_version": "3.11",
+  "dependency_manager": "pip",
+  "dependency_file": "requirements.txt",
+  "prewarm_instances": 2,
+  "idle_timeout": "5m"
+}
+```
+
+Supported runtimes: `python`, `node`, `go`, `java`, `ruby`, `rust`, `dotnet`, `custom`
+
+#### List Registered Functions
+
+```
+GET /api/warmpool/functions
+```
+
+#### Get Function Cache Configuration
+
+Returns the GitHub Actions cache configuration for a function:
+
+```
+GET /api/warmpool/functions/{name}/cache-config
+```
+
+Response:
+
+```json
+{
+    "function_name": "my-function",
+    "runtime": "python",
+    "cache_paths": ["~/.cache/pip", ".venv"],
+    "key_template": "python-3.11-my-function-{{hashFiles('**/requirements*.txt')}}"
+}
+```
+
+#### Generate Workflow Cache Step
+
+Returns a GitHub Actions workflow step for caching dependencies:
+
+```
+GET /api/warmpool/functions/{name}/workflow-cache
+```
+
+Response:
+
+```json
+{
+    "name": "Cache my-function dependencies",
+    "uses": "actions/cache@v4",
+    "with": {
+        "path": ["~/.cache/pip", ".venv"],
+        "key": "python-3.11-my-function-{{hashFiles('**/requirements*.txt')}}",
+        "restore-keys": ["python-3.11-my-function-", "python-3.11-"]
+    }
+}
+```
+
+#### Warm Up Instances
+
+```
+POST /api/warmpool/instances/{name}/warmup?count=3
+```
+
+#### Check Cache Status
+
+```
+POST /api/warmpool/cache/check
+Content-Type: application/json
+
+{
+  "function_name": "my-function",
+  "dependency_hash": "abc123..."
+}
+```
+
+Response:
+
+```json
+{
+    "function_name": "my-function",
+    "status": "hit",
+    "artifact": {
+        "cache_key": "python-3.11-my-function-abc123",
+        "build_duration": "45s"
+    },
+    "time_saved": "45s"
+}
+```
+
+#### Get Warm Pool Stats
+
+```
+GET /api/warmpool/stats
+```
+
+### Function Image Prebuilding
+
+The prebuild system automatically builds and caches function container images.
+
+#### Register Prebuild Specification
+
+```
+POST /api/prebuild/specs
+Content-Type: application/json
+
+{
+  "function_name": "my-function",
+  "image_name": "ghcr.io/myorg/my-function",
+  "image_tag": "latest",
+  "dockerfile": "Dockerfile",
+  "build_context": ".",
+  "platform": "linux/amd64",
+  "enabled": true,
+  "trigger_on_push": true,
+  "trigger_files": ["requirements.txt", "package.json"],
+  "layer_caching": {
+    "enabled": true,
+    "mode": "max",
+    "github_actions_cache": true
+  }
+}
+```
+
+#### Trigger a Prebuild
+
+```
+POST /api/prebuild/trigger/{name}
+```
+
+#### Get Workflow Build Configuration
+
+Returns the GitHub Actions workflow steps for building and caching:
+
+```
+GET /api/prebuild/workflow/{name}
+```
+
+Response:
+
+```json
+{
+    "function_name": "my-function",
+    "steps": [
+        {
+            "name": "Set up Docker Buildx",
+            "uses": "docker/setup-buildx-action@v3"
+        },
+        {
+            "name": "Cache Docker layers for my-function",
+            "uses": "actions/cache@v4",
+            "with": {
+                "path": "/tmp/.buildx-cache",
+                "key": "buildx-my-function-${{ github.sha }}"
+            }
+        },
+        {
+            "name": "Build and push my-function",
+            "uses": "docker/build-push-action@v5",
+            "with": {
+                "context": ".",
+                "file": "Dockerfile",
+                "push": true,
+                "tags": "ghcr.io/myorg/my-function:latest",
+                "cache-from": "type=local,src=/tmp/.buildx-cache",
+                "cache-to": "type=local,dest=/tmp/.buildx-cache-new,mode=max"
+            }
+        }
+    ]
+}
+```
+
+#### Get Latest Prebuilt Image
+
+```
+GET /api/prebuild/images/{name}/latest
+```
+
+#### List Builds
+
+```
+GET /api/prebuild/builds?function=my-function
+```
+
+#### Get Prebuild Stats
+
+```
+GET /api/prebuild/stats
+```
+
+Response:
+
+```json
+{
+    "total_specs": 5,
+    "total_builds": 42,
+    "total_images": 15,
+    "builds_by_status": {
+        "succeeded": 38,
+        "failed": 4
+    },
+    "average_build_duration": "2m30s",
+    "cache_hit_rate": 0.85,
+    "total_image_size": 1073741824
+}
+```
+
+### GitHub Actions Workflow Integration
+
+Use the generated cache configurations in your GitHub Actions workflows:
+
+```yaml
+name: Function Build
+
+on:
+    push:
+        paths:
+            - "functions/my-function/**"
+
+jobs:
+    build:
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v4
+
+            # Fetch cache configuration from the server
+            - name: Get cache config
+              id: cache-config
+              run: |
+                  curl -H "Authorization: Bearer ${{ secrets.API_KEY }}" \
+                    https://your-server/api/warmpool/functions/my-function/cache-config \
+                    -o cache-config.json
+
+            # Python dependency caching
+            - uses: actions/cache@v4
+              with:
+                  path: |
+                      ~/.cache/pip
+                      .venv
+                  key: python-3.11-my-function-${{ hashFiles('**/requirements*.txt') }}
+                  restore-keys: |
+                      python-3.11-my-function-
+                      python-3.11-
+
+            # Docker layer caching for image builds
+            - uses: docker/setup-buildx-action@v3
+
+            - uses: actions/cache@v4
+              with:
+                  path: /tmp/.buildx-cache
+                  key: buildx-my-function-${{ github.sha }}
+                  restore-keys: buildx-my-function-
+
+            - uses: docker/build-push-action@v5
+              with:
+                  context: .
+                  push: true
+                  tags: ghcr.io/myorg/my-function:latest
+                  cache-from: type=local,src=/tmp/.buildx-cache
+                  cache-to: type=local,dest=/tmp/.buildx-cache-new,mode=max
+
+            # GitHub Actions cache workaround
+            - name: Move cache
+              run: |
+                  rm -rf /tmp/.buildx-cache
+                  mv /tmp/.buildx-cache-new /tmp/.buildx-cache
+```
+
+### Runtime-Specific Cache Paths
+
+The system automatically configures cache paths based on runtime:
+
+| Runtime | Package Manager | Cache Paths                                   |
+| ------- | --------------- | --------------------------------------------- |
+| Python  | pip             | `~/.cache/pip`, `.venv`                       |
+| Node.js | npm             | `~/.npm`, `node_modules`                      |
+| Node.js | yarn            | `~/.cache/yarn`, `node_modules`               |
+| Node.js | pnpm            | `~/.local/share/pnpm/store`, `node_modules`   |
+| Go      | go mod          | `~/go/pkg/mod`, `~/.cache/go-build`           |
+| Java    | Maven           | `~/.m2/repository`                            |
+| Java    | Gradle          | `~/.gradle/caches`, `~/.gradle/wrapper`       |
+| Ruby    | Bundler         | `vendor/bundle`                               |
+| Rust    | Cargo           | `~/.cargo/bin`, `~/.cargo/registry`, `target` |
+| .NET    | NuGet           | `~/.nuget/packages`                           |
+
+### Cold Start Optimization Best Practices
+
+1. **Pre-warm instances**: Use the warm-up API before expected traffic spikes
+2. **Layer caching**: Enable Docker layer caching for image builds
+3. **Dependency caching**: Use lockfiles (package-lock.json, go.sum) for consistent cache keys
+4. **Scheduled prebuilds**: Configure scheduled builds during off-peak hours
+5. **Monitor stats**: Regularly check cache hit rates and optimize accordingly
+6. **Keep dependencies updated**: But use lockfiles for reproducible builds

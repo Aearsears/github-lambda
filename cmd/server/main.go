@@ -18,6 +18,7 @@ import (
 	"github.com/github-lambda/pkg/metrics"
 	"github.com/github-lambda/pkg/ratelimit"
 	"github.com/github-lambda/pkg/versioning"
+	"github.com/github-lambda/pkg/warmpool"
 )
 
 func main() {
@@ -259,6 +260,48 @@ func main() {
 	// Initialize admin handler
 	adminHandler := auth.NewAdminHandler(keyStore)
 
+	// Initialize warm pool manager for cold start optimization
+	warmPoolOpts := warmpool.DefaultManagerOptions()
+	if warmPoolFile := os.Getenv("WARMPOOL_FILE"); warmPoolFile != "" {
+		warmPoolOpts.ConfigFile = warmPoolFile
+	}
+	if maxPoolSize := os.Getenv("WARMPOOL_MAX_SIZE"); maxPoolSize != "" {
+		if v, err := strconv.Atoi(maxPoolSize); err == nil {
+			warmPoolOpts.MaxPoolSize = v
+		}
+	}
+	if artifactDir := os.Getenv("WARMPOOL_ARTIFACT_DIR"); artifactDir != "" {
+		warmPoolOpts.ArtifactDir = artifactDir
+	}
+
+	warmPoolManager := warmpool.NewManager(warmPoolOpts)
+	logger.Info("warm pool manager initialized", logging.Fields{
+		"max_pool_size": warmPoolOpts.MaxPoolSize,
+		"config_file":   warmPoolOpts.ConfigFile,
+	})
+
+	// Initialize prebuild manager
+	prebuildOpts := warmpool.PrebuildManagerOptions{
+		MaxQueueSize: 100,
+		WarmManager:  warmPoolManager,
+	}
+	if queueSize := os.Getenv("PREBUILD_QUEUE_SIZE"); queueSize != "" {
+		if v, err := strconv.Atoi(queueSize); err == nil {
+			prebuildOpts.MaxQueueSize = v
+		}
+	}
+
+	prebuildManager := warmpool.NewPrebuildManager(prebuildOpts)
+	logger.Info("prebuild manager initialized", logging.Fields{
+		"queue_size": prebuildOpts.MaxQueueSize,
+	})
+
+	// Initialize warm pool HTTP handler
+	warmPoolHandler := warmpool.NewHandler(warmPoolManager, prebuildManager)
+
+	// Initialize cold start middleware
+	coldStartMiddleware := warmpool.NewColdStartMiddleware(warmPoolManager, prebuildManager)
+
 	// Set up HTTP routes
 	mux := http.NewServeMux()
 
@@ -312,6 +355,10 @@ func main() {
 		logger.Info("configuration management routes registered")
 	}
 
+	// Warm pool and cold start optimization routes
+	warmPoolHandler.RegisterRoutes(mux)
+	logger.Info("warm pool routes registered")
+
 	// Determine if auth is enabled
 	authEnabled := os.Getenv("AUTH_DISABLED") != "true"
 	rateLimitEnabled := os.Getenv("RATE_LIMIT_DISABLED") != "true"
@@ -324,6 +371,16 @@ func main() {
 		logger.Info("rate limiting enabled")
 	} else {
 		logger.Warn("rate limiting DISABLED - not recommended for production")
+	}
+
+	// Apply cold start optimization middleware
+	coldStartEnabled := os.Getenv("COLDSTART_DISABLED") != "true"
+	if coldStartEnabled {
+		handler = coldStartMiddleware.Middleware(handler)
+		handler = coldStartMiddleware.WarmInstanceMiddleware(handler)
+		handler = coldStartMiddleware.CacheConfigMiddleware(handler)
+		handler = coldStartMiddleware.AutoPrebuildMiddleware(handler)
+		logger.Info("cold start optimization enabled")
 	}
 
 	// Apply authentication middleware if enabled

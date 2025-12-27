@@ -5,10 +5,12 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"time"
 
 	"github.com/github-lambda/internal/dispatcher"
 	"github.com/github-lambda/internal/handlers"
 	"github.com/github-lambda/pkg/auth"
+	"github.com/github-lambda/pkg/cache"
 	"github.com/github-lambda/pkg/dlq"
 	"github.com/github-lambda/pkg/events"
 	"github.com/github-lambda/pkg/logging"
@@ -186,6 +188,32 @@ func main() {
 		"max_retries":    retryPolicy.MaxRetries,
 	})
 
+	// Initialize result cache
+	cacheMaxEntries := 10000
+	if maxEntries := os.Getenv("CACHE_MAX_ENTRIES"); maxEntries != "" {
+		if v, err := strconv.Atoi(maxEntries); err == nil {
+			cacheMaxEntries = v
+		}
+	}
+
+	cacheDefaultTTL := 5 * time.Minute
+	if ttl := os.Getenv("CACHE_DEFAULT_TTL_SECONDS"); ttl != "" {
+		if v, err := strconv.Atoi(ttl); err == nil {
+			cacheDefaultTTL = time.Duration(v) * time.Second
+		}
+	}
+
+	resultCache := cache.NewCache(cacheMaxEntries, cacheDefaultTTL)
+	defer resultCache.Close()
+
+	// Initialize cache HTTP handler
+	cacheHandler := cache.NewHandler(resultCache)
+
+	logger.Info("result cache configured", logging.Fields{
+		"max_entries": cacheMaxEntries,
+		"default_ttl": cacheDefaultTTL.String(),
+	})
+
 	// Initialize admin handler
 	adminHandler := auth.NewAdminHandler(keyStore)
 
@@ -198,7 +226,7 @@ func main() {
 	mux.HandleFunc("/ratelimit/stats", rateLimitMiddleware.Handler())
 
 	// Protected routes
-	mux.HandleFunc("/invoke", handlers.InvokeHandler(d, limiter, versionResolver, retryer, dlqQueue))
+	mux.HandleFunc("/invoke", handlers.InvokeHandler(d, limiter, versionResolver, retryer, dlqQueue, resultCache))
 	mux.HandleFunc("/invoke/async", handlers.AsyncInvokeHandler(d, limiter, versionResolver, retryer, dlqQueue))
 	mux.HandleFunc("/status/", handlers.StatusHandler(d))
 	mux.HandleFunc("/callback", handlers.CallbackHandler(d, authMiddleware))
@@ -214,6 +242,9 @@ func main() {
 
 	// DLQ routes
 	dlqHandler.RegisterRoutes(mux)
+
+	// Cache routes
+	cacheHandler.RegisterRoutes(mux)
 
 	// Determine if auth is enabled
 	authEnabled := os.Getenv("AUTH_DISABLED") != "true"

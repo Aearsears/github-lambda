@@ -11,6 +11,7 @@ import (
 
 	"github.com/github-lambda/internal/dispatcher"
 	"github.com/github-lambda/pkg/auth"
+	"github.com/github-lambda/pkg/cache"
 	"github.com/github-lambda/pkg/dlq"
 	"github.com/github-lambda/pkg/logging"
 	"github.com/github-lambda/pkg/metrics"
@@ -21,7 +22,7 @@ import (
 var logger = logging.New("handlers")
 
 // InvokeHandler handles synchronous function invocations.
-func InvokeHandler(d *dispatcher.Dispatcher, limiter *ratelimit.Limiter, resolver *versioning.Resolver, retryer *dlq.Retryer, dlqQueue *dlq.Queue) http.HandlerFunc {
+func InvokeHandler(d *dispatcher.Dispatcher, limiter *ratelimit.Limiter, resolver *versioning.Resolver, retryer *dlq.Retryer, dlqQueue *dlq.Queue, resultCache *cache.Cache) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -87,6 +88,28 @@ func InvokeHandler(d *dispatcher.Dispatcher, limiter *ratelimit.Limiter, resolve
 		}
 		defer limiter.ReleaseFunction(req.FunctionName)
 
+		// Check cache for existing result (skip if no-cache header is set)
+		skipCache := r.Header.Get("Cache-Control") == "no-cache" || r.Header.Get("X-Skip-Cache") == "true"
+
+		if resultCache != nil && !skipCache {
+			if cachedEntry, err := resultCache.Get(req.FunctionName, resolvedVersion, req.Payload); err == nil {
+				logger.Info("cache hit", logging.Fields{
+					"function_name": req.FunctionName,
+					"version":       resolvedVersion,
+					"cache_key":     cachedEntry.Key,
+					"hit_count":     cachedEntry.HitCount,
+				})
+
+				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set("X-Cache", "HIT")
+				w.Header().Set("X-Cache-Key", cachedEntry.Key)
+				w.Header().Set("X-Cache-Age", fmt.Sprintf("%.0f", time.Since(cachedEntry.CreatedAt).Seconds()))
+				w.WriteHeader(cachedEntry.StatusCode)
+				w.Write(cachedEntry.Response)
+				return
+			}
+		}
+
 		logger.Info("handling sync invocation", logging.Fields{
 			"function_name": req.FunctionName,
 			"version":       resolvedVersion,
@@ -150,8 +173,35 @@ func InvokeHandler(d *dispatcher.Dispatcher, limiter *ratelimit.Limiter, resolve
 			return
 		}
 
+		// Serialize response for caching
+		responseBytes, err := json.Marshal(exec)
+		if err != nil {
+			logger.Error("failed to serialize response", logging.Fields{"error": err.Error()})
+		}
+
+		// Cache successful responses
+		if resultCache != nil && err == nil {
+			cacheEntry, cacheErr := resultCache.Set(
+				req.FunctionName,
+				resolvedVersion,
+				req.Payload,
+				responseBytes,
+				http.StatusOK,
+				map[string]string{
+					"original_function": originalFunctionName,
+					"alias":             resolvedAlias,
+				},
+			)
+			if cacheErr != nil && cacheErr != cache.ErrCacheDisabled {
+				logger.Warn("failed to cache response", logging.Fields{"error": cacheErr.Error()})
+			} else if cacheEntry != nil {
+				w.Header().Set("X-Cache", "MISS")
+				w.Header().Set("X-Cache-Key", cacheEntry.Key)
+			}
+		}
+
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(exec)
+		w.Write(responseBytes)
 	}
 }
 
